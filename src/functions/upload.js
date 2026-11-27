@@ -4,23 +4,30 @@
  * ============================================================================
  *
  *  WHAT IT DOES
- *    Accepts one image, checks it with the OpenAI Moderation API, and saves
- *    it to Azure Blob Storage ONLY if the image is safe. Unsafe images are
- *    rejected and never saved.
+ *    Accepts one image, checks that it is safe (OpenAI Moderation API) and of
+ *    good quality (local checks + an Azure OpenAI vision model), and saves it
+ *    to Azure Blob Storage ONLY if it passes everything. Rejected images are
+ *    never saved.
  *
  *  STEPS (each step can stop the request early)
  *
  *    Step 1  Read the image from the request ............ 400 if missing
  *    Step 2  Check the file size (max 15 MB) ............ 413 if too large
  *    Step 3  Check the file is a real, supported image .. 415 if not
- *    Step 4  Check quality: resolution and blur ......... 422 if too small/blurry
- *    Step 5  Ask OpenAI moderation if it is safe ........ 422 if unsafe
- *                                                         502 if the service fails
+ *    Step 4  Free local quality check: resolution, blur . 422 if too small/blurry
+ *    Step 5  Two AI checks, run AT THE SAME TIME:
+ *              a. OpenAI moderation: is it safe? ........ 422 if unsafe
+ *              b. Azure OpenAI vision: good quality? .... 422 if pixelated, upscaled, ...
+ *                                                         502 if either service fails
  *    Step 6  Save the image to Blob Storage ............. 201 on success
  *
+ *  Steps 1-4 are free and fast, so most bad uploads are rejected before any
+ *  paid AI call. The two AI checks in Step 5 run in parallel, so the wait is
+ *  the slower of the two, not both added together.
+ *
  *  SAFETY RULE: "FAIL CLOSED"
- *    If the moderation service can't be reached or returns an error, the
- *    image is NOT saved. We never store an image that hasn't been checked.
+ *    If either AI service can't be reached or returns an error, the image is
+ *    NOT saved. We never store an image that hasn't been fully checked.
  * ============================================================================
  */
 
@@ -30,6 +37,7 @@ const { randomUUID } = require('node:crypto');
 const { detectImageType, SUPPORTED_FORMATS } = require('../imageType');
 const { checkQuality } = require('../imageQuality');
 const { moderate } = require('../moderation');
+const { judgeQuality, isContentFilterError } = require('../llmQuality');
 
 // ----------------------------------------------------------------------------
 // Settings and shared objects (created once, when the function app starts)
@@ -182,12 +190,24 @@ app.http('upload', {
     }
 
     // ------------------------------------------------------------------------
-    // Step 5: Ask OpenAI moderation whether the image is safe
+    // Step 5: The two AI checks, started together so they run in parallel
+    //   a. OpenAI moderation: is the image safe?
+    //   b. Azure OpenAI vision model: is the quality good enough?
+    // Both receive the original, unchanged image bytes.
+    //
+    // allSettled waits for both and never throws; each result is either
+    // { status: 'fulfilled', value } or { status: 'rejected', reason: error }.
+    // Safety results are handled first, so an unsafe image is always reported
+    // as a policy block, whatever the quality model said.
     // ------------------------------------------------------------------------
-    let verdict; // { allowed: true/false, violations: [...], scores: {...} }
-    try {
-      verdict = await moderate(buffer, kind.type);
-    } catch (err) {
+    const [safety, aiQuality] = await Promise.allSettled([
+      moderate(buffer, kind.type),
+      judgeQuality(buffer, kind.type),
+    ]);
+
+    // --- 5a. Safety (OpenAI moderation) ---
+    if (safety.status === 'rejected') {
+      const err = safety.reason;
       context.error('Moderation call failed', err);
 
       // HTTP 400 from OpenAI means the image itself was invalid
@@ -201,6 +221,8 @@ app.http('upload', {
       return reply(502, { error: 'Content moderation unavailable; image not stored' });
     }
 
+    const verdict = safety.value; // { allowed: true/false, violations: [...], scores: {...} }
+
     if (!verdict.allowed) {
       // Record every blocked upload in the logs for auditing.
       context.warn(`Blocked upload (${originalName || 'unnamed'}): ${JSON.stringify(verdict.violations)}`);
@@ -211,6 +233,44 @@ app.http('upload', {
         error: 'Image blocked by content policy',
         violations: verdict.violations,
         scores: verdict.scores,
+      });
+    }
+
+    // --- 5b. Quality (Azure OpenAI vision model) ---
+    if (aiQuality.status === 'rejected') {
+      const err = aiQuality.reason;
+      context.error('AI quality check failed', err);
+
+      // Azure's own content filter refused the image. Moderation passed it,
+      // but we still treat this as a content block and don't store it.
+      if (isContentFilterError(err)) {
+        context.warn(`Blocked upload (${originalName || 'unnamed'}): Azure OpenAI content filter`);
+        return reply(422, {
+          error: 'Image blocked by content policy',
+          violations: [{ category: 'azure-content-filter' }],
+          scores: verdict.scores,
+        });
+      }
+
+      // Other HTTP 400s mean Azure OpenAI couldn't accept the image file.
+      if (err.status === 400) {
+        return reply(422, { error: 'Image rejected by quality check service validation', detail: err.message });
+      }
+
+      // Not configured, wrong key, rate limit, outage, timeout, bad answer.
+      // FAIL CLOSED: do not save the image.
+      return reply(502, { error: 'Quality check unavailable; image not stored' });
+    }
+
+    const aiVerdict = aiQuality.value; // { acceptable: true/false, problems: [...], reason: '...' }
+
+    if (!aiVerdict.acceptable) {
+      context.warn(`Rejected low-quality upload (${originalName || 'unnamed'}): ${aiVerdict.problems.join(', ')} - ${aiVerdict.reason}`);
+      return reply(422, {
+        error: 'Image quality too low',
+        problems: aiVerdict.problems,
+        reason: aiVerdict.reason,
+        quality: qualityCheck.quality,
       });
     }
 
@@ -237,6 +297,7 @@ app.http('upload', {
         originalname: encodeURIComponent(originalName || ''),
         quality: `${qualityCheck.quality.width}x${qualityCheck.quality.height},sharpness:${qualityCheck.quality.sharpness}`, // e.g. "1200x822,sharpness:416.7"
         moderation:Object.entries(verdict.scores).map(([k, v]) => `${k}:${v}`).join(','), // e.g. "sexual:0.0001,violence:0.0005,..."
+        aiquality: encodeURIComponent(aiVerdict.reason), // the vision model's one-sentence verdict
       },
     });
 
@@ -250,6 +311,7 @@ app.http('upload', {
       contentType: kind.type,
       size: buffer.length,
       quality: qualityCheck.quality,
+      aiQuality: { reason: aiVerdict.reason },
       scores: verdict.scores,
     });
   },

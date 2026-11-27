@@ -1,8 +1,10 @@
 # Image Upload with Automatic Content Moderation (POC)
 
-A proof of concept that lets users upload images and automatically rejects **low-quality** images (too small or blurry) and blocks **NSFW, violent or self-harm** images before they are stored. It runs on Azure Functions (Node.js) and Azure Blob Storage. Content is checked by the **OpenAI Moderation API**.
+A proof of concept that lets users upload images and automatically rejects **low-quality** images (too small, blurry, pixelated or upscaled) and blocks **NSFW, violent or self-harm** images before they are stored. It runs on Azure Functions (Node.js) and Azure Blob Storage. Content is checked by the **OpenAI Moderation API**. Quality is checked locally and by an **Azure OpenAI vision model**.
 
 **Status:** Working POC, deployed to Azure (resource group `souvik-rg-96`). Last verified on 2026-11-26.
+
+> **AI quality check: live since 2026-11-26** (Azure OpenAI `gpt-5.4-mini`). If the `QUALITY_AOAI_*` settings are missing or wrong, every image that passes the local checks gets 502. See [Enable the AI quality check](#enable-the-ai-quality-check).
 
 ## Contents
 
@@ -24,15 +26,18 @@ Any feature that lets users upload images carries a risk: someone uploads explic
 
 ### What this POC does
 
-Every uploaded image goes through two automatic checks **before** it is saved:
+Every uploaded image goes through three automatic checks **before** it is saved:
 
-1. **Quality check:** is the image big enough and sharp (not blurry)?
+1. **Local quality check (free):** is the image big enough and sharp (not blurry)?
 2. **Content check:** OpenAI's moderation model checks it for harmful content.
+3. **AI quality check:** an Azure OpenAI vision model looks for problems the local check can't see, such as pixelation or images enlarged from a tiny original.
+
+Checks 2 and 3 run at the same time, so the user waits for the slower one, not both.
 
 - **Good-quality, safe image:** saved to storage, and the user gets a success response.
-- **Too small or blurry image:** rejected with a clear reason, and **never saved**.
+- **Low-quality image:** rejected with a clear reason, and **never saved**.
 - **Unsafe image:** rejected with a clear reason, and **never saved**.
-- **Moderation service unavailable:** the image is rejected and not saved. The system never stores an image it could not check. This is called "failing closed".
+- **A checking service is unavailable:** the image is rejected and not saved. The system never stores an image it could not check. This is called "failing closed".
 
 ### At a glance
 
@@ -44,10 +49,16 @@ flowchart LR
     V -->|Yes| Q{Sharp enough?<br/>Min 300x300 px?}
     Q -->|No| R4[Reject 422<br/>low quality]
     Q -->|Yes| M[OpenAI<br/>Moderation API]
+    Q -->|Yes, at the same time| L[Azure OpenAI<br/>vision model]
     M -->|Scores| P{Passes<br/>our policy?}
     M -->|Error / outage| R3[Reject 502<br/>nothing stored]
+    L -->|Error / outage| R3
     P -->|No| R2[Reject 422<br/>nothing stored]
-    P -->|Yes| B[(Azure Blob Storage<br/>images container)]
+    L -->|Verdict| A{Quality<br/>acceptable?}
+    A -->|No| R4
+    P -->|Yes| S{Both<br/>passed?}
+    A -->|Yes| S
+    S -->|Yes| B[(Azure Blob Storage<br/>images container)]
     B --> OK[201 Created]
 ```
 
@@ -71,7 +82,12 @@ An earlier version of this POC used a different moderation service. In testing, 
 
 ## 2. How the quality check works
 
-Every image must pass two rules before it is sent for moderation.
+Quality is checked in two stages:
+
+- **Local check (free, ~tens of ms):** two rules, below. Images that fail never reach any paid service.
+- **AI check (Azure OpenAI):** catches what the local rules can't. See [The AI quality check](#the-ai-quality-check).
+
+Every image must pass the two local rules before it is sent to either AI service.
 
 ### Rule 1: Minimum resolution
 
@@ -105,7 +121,36 @@ Scores for a real photo (1200×822) and blurred or degraded copies of it:
 
 Images with very little detail **by design**, such as a plain background, a simple logo or a flat illustration, have few edges. They score low and may be rejected as blurry even though they are perfectly sharp. If such images are expected (e.g. logos), the threshold should be lowered, or the rule relaxed for them.
 
+The blur score also **cannot detect pixelation or upscaling**. A small image enlarged with hard, blocky pixels still has sharp edges, so it scores high. Example: a logo about 135 px wide, enlarged 3.5× to 543×545, scored 1640.9 and passed. Rule-based detectors we tried for this were unreliable. This is why the AI quality check exists.
+
 The minimum resolution and the blur threshold are app settings, so they can be changed without a code change.
+
+### The AI quality check
+
+Images that pass the local rules are sent to an **Azure OpenAI vision model** (default deployment `gpt-5.4-mini`). It runs at the same time as moderation.
+
+- **The original upload is sent, unchanged.** It is never resized, cropped or re-compressed first, because that would change the quality being judged.
+- The image is sent with `detail: original`, so the model looks at it at its real resolution instead of shrinking it internally. This needs the `gpt-5.4` model family; older models such as `gpt-4.1` reject it.
+- The model judges **technical quality only**, not content. It first describes the edges it sees (`edge_observation`), then decides. Smooth, anti-aliased edges pass; staircase steps several pixels wide fail.
+- It must answer in a fixed JSON format, enforced by Azure OpenAI ("structured output"):
+
+```json
+{ "acceptable": false, "problems": ["pixelated", "upscaled"], "reason": "Edges show visible square pixel blocks." }
+```
+
+Problems it can report: `blurry`, `pixelated`, `upscaled`, `compression_artifacts`, `noisy`, `bad_exposure`.
+
+The instructions given to the model are in `src/llmQuality.js` (`INSTRUCTIONS`). Changing what counts as "low quality" means editing that text and redeploying.
+
+**Consistency test (2026-11-26, `gpt-5.4-mini`).** 12 labelled images, each checked 4 times. The "bad" images are clean photos and logos made blocky by shrinking and enlarging them 3× to 6×, plus the real pixelated Ronin logo.
+
+| Prompt version | Correct | Images with flip-flopping answers | Ronin logo | Clean images passed | Median time |
+|---|---|---|---|---|---|
+| First version ("accept crisp logos", "if unsure, accept") | 38/48 | 1 | 2/4 rejected | 24/24 | 3.8 s |
+| **Current** (edge description first, `detail: original`) | **43/48** | 2 (both borderline) | **4/4 rejected** | **24/24** | 3.9 s |
+| Same, plus model "reasoning" | 40/48 | 2 | 4/4 rejected | 24/24 | 4.2 s (not used) |
+
+Every clean image passed in every run, and every image enlarged 3.5× or more was rejected every time. The remaining misses are images enlarged only 3×, which look only slightly soft at normal size. These are borderline; a stricter prompt would start rejecting good images.
 
 ---
 
@@ -183,6 +228,7 @@ A lower threshold is stricter: more images get blocked. The thresholds are app s
 | Files over 15 MB are rejected | Yes | 16 MB file returned 413 |
 | Requests without an access key are rejected | Yes | Returned 401 |
 | Moderation outage does not let images through | By design | The code rejects the image (502) if the check fails |
+| Pixelated / upscaled images are rejected | Yes | Pixelated Ronin logo returned 422 `pixelated, upscaled` on the live endpoint; clean logo stored. Mild 3× enlargements are not reliably caught |
 | Detection of sexual / NSFW images | **Not yet** | Needs a controlled, legally sourced test set |
 | Accuracy at scale (false positive / negative rates) | **Not yet** | Needs a larger labelled test set |
 | Blur threshold on real user photos | **Not yet** | Tuned on one photo plus synthetic blur; needs real uploads |
@@ -198,15 +244,24 @@ A lower threshold is stricter: more images get blocked. The thresholds are app s
 4. **What does the user see when blocked?** The API returns the reason (e.g. "violence"). The product needs to decide the on-screen message.
 5. **Do we need hate-symbol detection in images?** OpenAI doesn't cover it. See [Risks](#risks-and-limitations).
 6. **What counts as "low quality"?** The minimum resolution (300×300 px) and blur threshold (100) are starting values. Should logos and flat graphics be accepted? They may be rejected as blurry today. See [Known limitation](#known-limitation).
+7. **Is the AI quality check worth its cost?** It is the only paid step: about $1.3 per 1,000 images that pass the local checks (estimate). See [Cost](#cost).
 
 ### Cost
 
-The OpenAI Moderation API is **free**. Paid alternatives we compared (official list prices in USD, November 2026):
+The OpenAI Moderation API is **free**. The AI quality check is the only paid step:
+
+| Step | Price | At 100,000 images per month |
+|---|---|---|
+| Local quality check | Free (runs inside the Function) | $0 |
+| **OpenAI Moderation API** | **Free** | **$0** |
+| **Azure OpenAI gpt-5.4-mini quality check** | ~$1.3 per 1,000 images (measured ~1,250 tokens per image of up to ~1200 px; larger images use more tokens) | ~$130 |
+
+The quality check price is calculated from measured token use and list prices ($0.75 per 1M input tokens, $4.50 per 1M output tokens for gpt-5.4-mini). Confirm current Azure prices before budgeting. Bigger images use more tokens. Images rejected by the local checks cost nothing. Measure the real figure on sample images before committing to a budget.
+
+Paid moderation alternatives we compared (official list prices in USD, November 2026):
 
 | Service | Price | At 100,000 images per month |
 |---|---|---|
-| **OpenAI Moderation API (current)** | **Free** | **$0** |
-| Azure OpenAI gpt-4.1-mini (custom policy prompt) | ~$0.88 per 1,000 images (estimate) | ~$88 |
 | AWS Rekognition moderation | $1.00 per 1,000 (first 1M) | $100 |
 | Azure AI Vision (gore/adult detection) | $1.00 per 1,000 | $100 |
 | Google Cloud Vision SafeSearch | $1.50 per 1,000 | ~$148.50 |
@@ -224,6 +279,7 @@ The Azure Function and Blob Storage add small pay-per-use costs on top.
 | Does OpenAI use them to train models? | **To be confirmed** against OpenAI's API data terms |
 | Contract | Separate OpenAI account and terms, not covered by our Azure agreement |
 | Uptime guarantee (SLA) | None published for the free moderation endpoint |
+| AI quality check | Runs on **our own Azure OpenAI resource**, inside our Azure tenant and Azure agreement. Region depends on where the resource is created |
 
 **Action:** legal/compliance should review OpenAI's API data-usage and retention terms before production use.
 
@@ -240,6 +296,9 @@ The Azure Function and Blob Storage add small pay-per-use costs on top.
 | Not tested on sexual content yet | Unknown NSFW accuracy | Run a controlled test set before launch |
 | Sharp but simple images (logos, flat graphics, plain backgrounds) rejected as blurry | Legitimate uploads refused | Lower `MIN_SHARPNESS`, or relax the rule for these image types |
 | Blur threshold tuned on limited samples | Too strict or too lenient on real photos | Re-tune with real uploads using `scripts/score.js` |
+| AI quality check not yet tested | Unknown accuracy; could reject good images or accept bad ones | Test on sample images (sharp, blurry, pixelated, upscaled) before going live |
+| AI quality model gives slightly different answers on borderline images | The same image may pass once and fail once | `temperature: 0` reduces this; review borderline rejections |
+| Azure OpenAI's own content filter refuses some images | Treated as a content block (422) | Intended; the image is not stored |
 
 ### Recommended next steps
 
@@ -259,6 +318,7 @@ The Azure Function and Blob Storage add small pay-per-use costs on top.
 | Function App (Flex Consumption, Node 22, 2 GB) | `csafe-poc-func-igc47` | centralindia | Hosts the `POST /api/upload` endpoint |
 | Storage account | `csafepocigc47` | centralindia | Container `images` holds approved uploads; also used by the Functions runtime. Public blob access is **disabled** |
 | OpenAI Moderation API | external (`api.openai.com`) | n/a | Checks every image. Authenticated with an OpenAI API key |
+| Azure OpenAI vision model | Foundry resource (endpoint in settings) | tbd | AI quality check. Called through the Azure OpenAI **v1 API** with the `openai` npm package and an API key |
 
 Both Azure resources are in resource group **`souvik-rg-96`**. Application Insights was removed for this POC. Watch live logs with `func azure functionapp logstream csafe-poc-func-igc47`.
 
@@ -272,10 +332,11 @@ Each step can stop the request. Only images that pass every step reach storage.
 | 1 | Read the image from form field `file`, or from the raw body | 400 |
 | 2 | Check the real size: not empty, and at most **15 MB** | 400 / 413 |
 | 3 | Check the file's **actual bytes** are a JPEG, PNG, GIF or WEBP (the client's `Content-Type` is not trusted) | 415 |
-| 4 | Quality check: decode the image, require at least 300×300 px and sharpness ≥ 100. Runs before moderation, so low-quality images never reach OpenAI | 422 |
-| 5 | Send to the OpenAI Moderation API. **Fails closed** | 422 (invalid image) / 502 (service error) |
-| 6 | Apply our policy: block if any score ≥ threshold, or if OpenAI flagged it | 422 |
-| 7 | Save to `images/<YYYY-MM-DD>/<uuid>.<ext>` with content type and audit metadata | 201 |
+| 4 | Local quality check: decode the image, require at least 300×300 px and sharpness ≥ 100. Runs first, so low-quality images never reach a paid or external service | 422 |
+| 5 | Start **both** AI calls at once (`Promise.allSettled`), each with the original image bytes: **5a** OpenAI Moderation API, **5b** Azure OpenAI quality model | |
+| 5a | Moderation result. Apply our policy: block if any score ≥ threshold, or if OpenAI flagged it. **Fails closed**. Checked first, so an unsafe image is always reported as a policy block | 422 (blocked / invalid image) / 502 (service error) |
+| 5b | AI quality result: reject if `acceptable` is false. Azure content-filter refusals count as a content block. **Fails closed** | 422 (low quality / blocked / invalid image) / 502 (service error) |
+| 6 | Save to `images/<YYYY-MM-DD>/<uuid>.<ext>` with content type and audit metadata | 201 |
 
 ### API reference
 
@@ -319,9 +380,11 @@ On Windows PowerShell, use `curl.exe`; plain `curl` runs a different command (`I
   "contentType": "image/jpeg",
   "size": 60683,
   "quality": { "width": 800, "height": 600, "sharpness": 1503.7 },
+  "aiQuality": { "reason": "Sharp, clean image with no visible defects." },
   "scores": { "sexual": 0, "violence": 0.0005, "violence/graphic": 0, "self-harm": 0, "self-harm/intent": 0, "self-harm/instructions": 0 }
 }
 ```
+
 
 **Low quality, 422:**
 
@@ -333,6 +396,17 @@ On Windows PowerShell, use `curl.exe`; plain `curl` runs a different command (`I
     "Image is too blurry: sharpness 15.6 (minimum 100)"
   ],
   "quality": { "width": 200, "height": 200, "sharpness": 15.6 }
+}
+```
+
+**Low quality from the AI check, 422** (same `error`, plus the model's `reason`):
+
+```json
+{
+  "error": "Image quality too low",
+  "problems": ["pixelated", "upscaled"],
+  "reason": "Edges show visible square pixel blocks from enlargement.",
+  "quality": { "width": 543, "height": 545, "sharpness": 1640.9 }
 }
 ```
 
@@ -351,19 +425,19 @@ The `url` is private. Reading it requires a SAS token or Entra ID auth.
 }
 ```
 
-When a block comes from OpenAI's own `flagged` verdict rather than our threshold, the violation shows `"threshold": "openai-flagged"`.
+When a block comes from OpenAI's own `flagged` verdict rather than our threshold, the violation shows `"threshold": "openai-flagged"`. When Azure OpenAI's content filter refuses the image during the quality check, the violation is `{ "category": "azure-content-filter" }`.
 
 **All status codes:**
 
 | Status | Meaning |
 |---|---|
-| 201 | Image passed moderation and was stored |
+| 201 | Image passed every check and was stored |
 | 400 | Missing `file` field, empty body, or unreadable request |
 | 401 | Missing or wrong function key (Azure only) |
 | 413 | Larger than 15 MB |
 | 415 | Not a JPEG, PNG, GIF or WEBP. Also returned for renamed files, e.g. an AVIF saved as `.jpeg` |
-| 422 | One of: quality too low (`problems` explains why); image could not be decoded (corrupt file); blocked by content policy (`violations` explains why); OpenAI rejected the image as invalid (e.g. an animated GIF). The `error` field says which |
-| 502 | OpenAI unavailable, throttled or erroring. Nothing stored |
+| 422 | One of: quality too low (`problems` explains why); image could not be decoded (corrupt file); blocked by content policy (`violations` explains why); OpenAI or Azure OpenAI rejected the image as invalid (e.g. an animated GIF). The `error` field says which |
+| 502 | OpenAI moderation or Azure OpenAI unavailable, throttled, erroring or not configured. `error` says which ("Content moderation unavailable" or "Quality check unavailable"). Nothing stored |
 
 ### Project structure
 
@@ -373,12 +447,14 @@ content-safety-poc/
 │   ├── functions/
 │   │   └── upload.js          # The HTTP endpoint: the 6-step pipeline and the blob upload
 │   ├── imageType.js           # Detects the real image format from the file's bytes
-│   ├── imageQuality.js        # Resolution and blur (sharpness) check, using the sharp library
+│   ├── imageQuality.js        # Local resolution and blur (sharpness) check, using the sharp library
+│   ├── llmQuality.js          # AI quality check: Azure OpenAI vision model, prompt and answer format
 │   └── moderation.js          # OpenAI Moderation API call + our blocking policy
 ├── scripts/
-│   └── score.js               # Dev tool: quality + moderation scores without storing anything (not deployed)
+│   └── score.js               # Dev tool: runs every check without storing anything (not deployed)
 ├── test/
-│   ├── imageQuality.test.js   # Unit tests for the quality check
+│   ├── imageQuality.test.js   # Unit tests for the local quality check
+│   ├── llmQuality.test.js     # Unit tests for reading the AI model's answer (no network)
 │   └── moderation.test.js     # Unit tests for file-type detection and the blocking policy
 ├── test-images/               # Sample files: sharp.jpg, blurry.jpg, low-res.jpg, safe.png, fake.png (not deployed)
 ├── host.json                  # Functions host config
@@ -391,15 +467,20 @@ content-safety-poc/
 
 | Decision | Why |
 |---|---|
-| Plain `fetch` instead of an SDK or axios | `fetch` is built into Node 18+, so there's one dependency fewer. Errors are handled explicitly by checking `res.ok` and keeping the HTTP status |
+| Plain `fetch` for OpenAI moderation, instead of an SDK or axios | `fetch` is built into Node 18+, and the call is simple. Errors are handled explicitly by checking `res.ok` and keeping the HTTP status |
+| `openai` npm package for the quality check, using the Azure OpenAI **v1 API** (`OpenAI` client with `baseURL = <host>/openai/v1/`) | Microsoft documents this package for Azure OpenAI in JavaScript; the older `@azure/openai` package is retired. The `AzureOpenAI` class targets the older dated-version API and returns 404 on a `/openai/v1` endpoint. Any endpoint form from the portal works: only the host is used |
+| Moderation and AI quality calls run in parallel | The user waits for the slower call, not both added together. Trade-off: the quality call is still paid for when moderation blocks the image |
+| Original bytes sent to the AI quality model, never resized | Shrinking would hide pixelation and blur, and change the quality being judged |
+| Structured output (JSON schema) for the AI verdict | The answer is always machine-readable; a malformed answer fails closed |
+| AI quality check runs after the local checks | Free checks remove obviously bad images before any paid call |
 | Image sent inline as base64 | Sending a URL instead would mean storing (and exposing) the image before it is checked |
 | File type from magic bytes | The client's file name and `Content-Type` can be wrong or faked |
 | Fixed 15 MB upload limit (`MAX_UPLOAD_BYTES` in `upload.js`) | Keeps memory use and request time predictable, and stays under OpenAI's 20 MB limit |
-| Fail closed on any moderation error | An unchecked image must never be stored |
+| Fail closed on any moderation or AI quality error | An unchecked image must never be stored |
 | Our thresholds **plus** OpenAI's `flagged` verdict | Our settings can only tighten OpenAI's defaults, never loosen them |
 | Random UUID blob names | Avoids overwrites, and keeps user-supplied file names out of storage paths |
-| Scores saved as blob metadata (`quality`, `moderation`) | Audit trail showing why each stored image was allowed |
-| Quality check runs before moderation | Rejects low-quality images faster, and they are never sent to OpenAI |
+| Scores saved as blob metadata (`quality`, `moderation`, `aiquality`) | Audit trail showing why each stored image was allowed |
+| Local quality check runs before both AI calls | Rejects low-quality images faster, and they are never sent to OpenAI or Azure OpenAI |
 | Blur measured on a greyscale copy scaled to max 1024 px | Same yardstick for every image size, and fast (tens of milliseconds) |
 | `sharp` (libvips) for decoding | Fast, widely used, and handles EXIF rotation. It ships native binaries, so deploy with a **remote build** (see Deploy) |
 
@@ -416,6 +497,9 @@ content-safety-poc/
 | `MIN_IMAGE_WIDTH` | `300` | Reject images narrower than this (pixels) |
 | `MIN_IMAGE_HEIGHT` | `300` | Reject images shorter than this (pixels) |
 | `MIN_SHARPNESS` | `100` | Reject images with a sharpness score below this. Higher = stricter |
+| `QUALITY_AOAI_ENDPOINT` | (required) | Azure OpenAI resource endpoint, e.g. `https://<resource>.openai.azure.com` |
+| `QUALITY_AOAI_API_KEY` | (secret) | Key of that Azure OpenAI resource |
+| `QUALITY_AOAI_DEPLOYMENT` | `gpt-5.4-mini` | Name of the vision model **deployment** in that resource |
 | `IMAGES_STORAGE_CONNECTION` | (secret) | Connection string of the storage account that holds images |
 | `IMAGES_CONTAINER` | `images` | Container for approved images |
 
@@ -441,7 +525,7 @@ func start        # http://localhost:7071/api/upload (no function key needed loc
 az storage account show-connection-string -n csafepocigc47 -g souvik-rg-96 --query connectionString -o tsv
 ```
 
-Add your own OpenAI key as `OPENAI_API_KEY`. **Never commit `local.settings.json`**, and never paste keys into chat or tickets.
+Add your own OpenAI key as `OPENAI_API_KEY`, and the Azure OpenAI endpoint and key as `QUALITY_AOAI_ENDPOINT` and `QUALITY_AOAI_API_KEY`. **Never commit `local.settings.json`**, and never paste keys into chat or tickets.
 
 ### Score images and tune thresholds
 
@@ -449,12 +533,13 @@ Add your own OpenAI key as `OPENAI_API_KEY`. **Never commit `local.settings.json
 node scripts/score.js test-images/sharp.jpg path/to/other.jpg
 ```
 
-Each image goes through the same quality and moderation checks the endpoint uses. Nothing is uploaded or stored:
+Each image goes through the same checks the endpoint uses. Nothing is uploaded or stored. The AI quality line costs one billed Azure OpenAI call per image:
 
 ```
 blurry.jpg (image/jpeg, 40735 bytes)
   quality: FAIL 800x600 sharpness=7.3 -> Image is too blurry: sharpness 7.3 (minimum 100)
   moderation: ALLOW (768 ms) sexual=0 violence=0 violence/graphic=0 ...
+  ai quality: FAIL (... ms, ... tokens) [blurry] ...
 ```
 
 ### Deploy
@@ -466,6 +551,25 @@ func azure functionapp publish csafe-poc-func-igc47 --javascript --build remote
 **Always use `--build remote`.** The `sharp` image library includes native binaries. A local build on Windows packages the Windows binaries, which crash on the Linux Function App. A remote build runs `npm install` on Linux in Azure.
 
 Before deploying a change that needs a new setting, add it to the Function App first. Otherwise uploads fail with 502.
+
+### Enable the AI quality check
+
+The code is ready, but needs an Azure OpenAI resource first. In this order:
+
+1. Create an Azure OpenAI resource in `souvik-rg-96`, in a region that offers `gpt-5.4-mini`.
+2. Deploy the `gpt-5.4-mini` model in it. Note the deployment name.
+3. Add the three `QUALITY_AOAI_*` settings to `local.settings.json`, and test locally with `node scripts/score.js test-images/*.jpg`.
+4. Add the same settings to the Function App:
+
+   ```bash
+   az functionapp config appsettings set -n csafe-poc-func-igc47 -g souvik-rg-96 --settings \
+     QUALITY_AOAI_ENDPOINT="https://<resource>.openai.azure.com" QUALITY_AOAI_API_KEY="<key>" \
+     QUALITY_AOAI_DEPLOYMENT=gpt-5.4-mini
+   ```
+
+5. Deploy with `--build remote`.
+
+Without these settings, the new code returns 502 "Quality check unavailable" for every image that passes the local checks.
 
 ### How the Azure resources were created
 
@@ -497,7 +601,9 @@ Application Insights was created automatically with the Function App and later d
 | Symptom | Likely cause |
 |---|---|
 | 401 in Azure | Missing or wrong `x-functions-key` |
-| 502 on every request | `OPENAI_API_KEY` missing or wrong, OpenAI rate limit hit, or an OpenAI outage. Check `func azure functionapp logstream csafe-poc-func-igc47` |
+| 502 "Content moderation unavailable" | `OPENAI_API_KEY` missing or wrong, OpenAI rate limit hit, or an OpenAI outage. Check `func azure functionapp logstream csafe-poc-func-igc47` |
+| 502 "Quality check unavailable" | `QUALITY_AOAI_*` settings missing or wrong (wrong deployment name gives 404), Azure OpenAI quota/rate limit (429), timeout, or the model returned an unreadable answer. Check the log stream |
+| 422 "Image quality too low" with `reason` for a good image | The AI model judged it wrongly. Check the `problems` and `reason`; adjust `INSTRUCTIONS` in `src/llmQuality.js` if it happens often |
 | 415 for a file that looks like a JPEG | The file is really another format (often AVIF or HEIC from browsers and phones). Re-save it as JPEG or PNG |
 | 415 for BMP or TIFF | OpenAI doesn't accept these formats. Convert to JPEG or PNG |
 | 422 "rejected by moderation service validation" | Corrupt or animated image |
@@ -513,7 +619,7 @@ Application Insights was created automatically with the Function App and later d
 | Area | POC today | Production recommendation |
 |---|---|---|
 | Moderation | OpenAI free endpoint | Compliance sign-off; add a fallback service for outages |
-| Secrets | Keys in Function App settings | **Key Vault** references; managed identity for Azure Storage |
+| Secrets | Keys in Function App settings | **Key Vault** references; managed identity for Azure Storage and Azure OpenAI (keyless, via `@azure/identity`) |
 | API auth | Function key | Entra ID / API Management in front of the function; per-user identity for abuse tracking |
 | Resilience | Single attempt; fails closed | Retry with backoff on 429/5xx; fallback service |
 | Coverage gaps | No hate-symbol detection for images | Add a custom-policy check (e.g. Azure OpenAI vision model) if the product requires it |
@@ -528,6 +634,8 @@ Application Insights was created automatically with the Function App and later d
 ## 7. References
 
 - [OpenAI Moderation guide](https://developers.openai.com/api/docs/guides/moderation)
+- [Azure OpenAI: use vision-enabled chat models (JavaScript)](https://learn.microsoft.com/azure/foundry/openai/how-to/gpt-with-vision?pivots=programming-language-javascript)
+- [openai npm package](https://www.npmjs.com/package/openai)
 - [sharp image library](https://sharp.pixelplumbing.com/)
 - [Azure Functions Node.js v4 developer guide](https://learn.microsoft.com/azure/azure-functions/functions-reference-node)
 - [Azure Functions Flex Consumption plan](https://learn.microsoft.com/azure/azure-functions/flex-consumption-plan)
